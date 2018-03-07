@@ -24,6 +24,7 @@ using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Http;
 using Microsoft.AspNetCore.Server.Kestrel.Core.Internal.Infrastructure;
 using Microsoft.AspNetCore.Testing;
 using Microsoft.AspNetCore.Testing.xunit;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Moq;
 using Newtonsoft.Json;
@@ -1617,6 +1618,90 @@ namespace Microsoft.AspNetCore.Server.Kestrel.FunctionalTests
                         "Content-Length: 0",
                         "",
                         "");
+                }
+            }
+        }
+        
+        [Theory]
+        [InlineData(2, 4)]
+        [InlineData(16, 32)]
+        [InlineData(128, 256)]
+        [InlineData(512, 1024)]
+        [InlineData(1024, 2048)]
+        public async Task LargeMultipartRequest(int partOneSizeInMb, int partTwoSizeInMb)
+        {
+            long multipartEncodingLength = 125;
+            long contentLength = 1024L * 1024L * (partOneSizeInMb + partTwoSizeInMb) + multipartEncodingLength;
+            var listenOptions = new ListenOptions(new IPEndPoint(IPAddress.Loopback, 0));
+            var testLogger = new TestApplicationErrorLogger();
+            var testContext = new TestServiceContext { Log = new TestKestrelTrace(testLogger) };
+
+            void ConfigureLimits(IServiceCollection collection)
+            {
+                collection.AddOptions<KestrelServerOptions>()
+                    .Configure(options =>
+                    {
+                        options.Limits.MaxRequestBodySize = contentLength * 2L;
+                        options.Limits.MinRequestBodyDataRate = null;
+                    });
+            }
+
+            using (var server = new TestServer(async httpContext =>
+            {
+                var response = httpContext.Response;
+                var request = httpContext.Request;
+
+                var buffer = new byte[1024 ^ 2];
+
+                while (await request.Body.ReadAsync(buffer, 0, buffer.Length) != 0)
+                {
+                    ;// read to end
+                }
+
+                response.Headers["Content-Length"] = new[] { "11" };
+
+                await response.Body.WriteAsync(Encoding.ASCII.GetBytes("Hello World"), 0, 11);
+            }, testContext, listenOptions, ConfigureLimits))
+            {
+                using (var connection = server.CreateConnection())
+                {
+                    try
+                    {
+                        connection.Socket.Send(Encoding.Default.GetBytes($"POST / HTTP/1.1\r\n" +
+                                                      $"Host:\r\n" +
+                                                      $"Content-Type: multipart/form-data; boundary=--==========12345678\r\n" +
+                                                      $"Content-Length: {contentLength}\r\n\r\n"));
+                        int bytesSent = 0;
+                        while (bytesSent < contentLength)
+                        {
+                            var bytes = new byte[1024 * 1024];
+                            if (bytesSent == 1024 * 1024 * partOneSizeInMb)
+                            {
+                                connection.Socket.Send(Encoding.Default.GetBytes("--==========12345678\r\n" +
+                                                                                 "Content-type: text/plain\r\n\r\n"));
+                            }
+                            connection.Socket.Send(bytes);
+                            bytesSent += bytes.Length;
+                        }
+
+                        connection.Socket.Send(Encoding.Default.GetBytes("--==========12345678--"));
+
+                        await connection.Receive(
+                            "HTTP/1.1 200 OK",
+                            "");
+                        await connection.ReceiveForcedEnd(
+                            $"Date: {testContext.DateHeaderValue}",
+                            "Content-Length: 11",
+                            "",
+                            "Hello World");
+                    }
+                    catch (Exception e)
+                    {
+                        Console.WriteLine(e);
+                    }
+                    var error = testLogger.Messages.Where(message => message.LogLevel == LogLevel.Error);
+                    Assert.Empty(error);
+                    Assert.All(error, message => message.Equals("Derp"));
                 }
             }
         }
